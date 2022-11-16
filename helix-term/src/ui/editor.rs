@@ -1,7 +1,8 @@
 use crate::{
     commands,
     compositor::{Component, Context, Event, EventResult},
-    job, key,
+    job::{self, Callback},
+    key,
     keymap::{KeymapResult, Keymaps},
     ui::{Completion, ProgressSpinners},
 };
@@ -13,9 +14,10 @@ use helix_core::{
     movement::Direction,
     syntax::{self, HighlightEvent},
     unicode::{segmentation::UnicodeSegmentation, width::UnicodeWidthStr},
-    LineEnding, Position, Range, Selection, Transaction,
+    visual_coords_at_pos, LineEnding, Position, Range, Selection, Transaction,
 };
 use helix_view::{
+    apply_transaction,
     decorations::{TextAnnotation, TextAnnotationKind},
     document::{Mode, SCRATCH_BUFFER_NAME},
     editor::{CompleteAction, CursorShapeConfig},
@@ -24,7 +26,7 @@ use helix_view::{
     keyboard::{KeyCode, KeyModifiers},
     Document, Editor, Theme, View,
 };
-use std::{borrow::Cow, path::PathBuf};
+use std::{borrow::Cow, cmp::min, num::NonZeroUsize, path::PathBuf};
 
 use tui::buffer::Buffer as Surface;
 
@@ -34,6 +36,7 @@ use super::statusline;
 pub struct EditorView {
     pub keymaps: Keymaps,
     on_next_key: Option<Box<dyn FnOnce(&mut commands::Context, KeyEvent)>>,
+    pseudo_pending: Vec<KeyEvent>,
     last_insert: (commands::MappableCommand, Vec<InsertEvent>),
     pub(crate) completion: Option<Completion>,
     spinners: ProgressSpinners,
@@ -57,6 +60,7 @@ impl EditorView {
         Self {
             keymaps,
             on_next_key: None,
+            pseudo_pending: Vec::new(),
             last_insert: (commands::MappableCommand::normal_mode, Vec::new()),
             completion: None,
             spinners: ProgressSpinners::default(),
@@ -76,7 +80,7 @@ impl EditorView {
         surface: &mut Surface,
         is_focused: bool,
     ) {
-        let inner = view.inner_area();
+        let inner = view.inner_area(doc);
         let area = view.area;
         let theme = &editor.theme;
 
@@ -117,9 +121,19 @@ impl EditorView {
         if is_focused && editor.config().cursorline {
             Self::highlight_cursorline(doc, view, surface, theme);
         }
+        if is_focused && editor.config().cursorcolumn {
+            Self::highlight_cursorcolumn(doc, view, surface, theme);
+        }
 
-        let highlights = Self::doc_syntax_highlights(doc, view.offset, inner.height, theme);
-        let highlights = syntax::merge(highlights, Self::doc_diagnostics_highlights(doc, theme));
+        let mut highlights = Self::doc_syntax_highlights(doc, view.offset, inner.height, theme);
+        for diagnostic in Self::doc_diagnostics_highlights(doc, theme) {
+            // Most of the `diagnostic` Vecs are empty most of the time. Skipping
+            // a merge for any empty Vec saves a significant amount of work.
+            if diagnostic.is_empty() {
+                continue;
+            }
+            highlights = Box::new(syntax::merge(highlights, diagnostic));
+        }
         let highlights: Box<dyn Iterator<Item = HighlightEvent>> = if is_focused {
             Box::new(syntax::merge(
                 highlights,
@@ -214,16 +228,16 @@ impl EditorView {
         _theme: &Theme,
     ) -> Box<dyn Iterator<Item = HighlightEvent> + 'doc> {
         let text = doc.text().slice(..);
-        let last_line = std::cmp::min(
-            // Saturating subs to make it inclusive zero indexing.
-            (offset.row + height as usize).saturating_sub(1),
-            doc.text().len_lines().saturating_sub(1),
-        );
 
         let range = {
-            // calculate viewport byte ranges
-            let start = text.line_to_byte(offset.row);
-            let end = text.line_to_byte(last_line + 1);
+            // Calculate viewport byte ranges:
+            // Saturating subs to make it inclusive zero indexing.
+            let last_line = doc.text().len_lines().saturating_sub(1);
+            let last_visible_line = (offset.row + height as usize)
+                .saturating_sub(1)
+                .min(last_line);
+            let start = text.line_to_byte(offset.row.min(last_line));
+            let end = text.line_to_byte(last_visible_line + 1);
 
             start..end
         };
@@ -263,7 +277,7 @@ impl EditorView {
     pub fn doc_diagnostics_highlights(
         doc: &Document,
         theme: &Theme,
-    ) -> Vec<(usize, std::ops::Range<usize>)> {
+    ) -> [Vec<(usize, std::ops::Range<usize>)>; 5] {
         use helix_core::diagnostic::Severity;
         let get_scope_of = |scope| {
             theme
@@ -284,22 +298,38 @@ impl EditorView {
         let error = get_scope_of("diagnostic.error");
         let r#default = get_scope_of("diagnostic"); // this is a bit redundant but should be fine
 
-        doc.diagnostics()
-            .iter()
-            .map(|diagnostic| {
-                let diagnostic_scope = match diagnostic.severity {
-                    Some(Severity::Info) => info,
-                    Some(Severity::Hint) => hint,
-                    Some(Severity::Warning) => warning,
-                    Some(Severity::Error) => error,
-                    _ => r#default,
-                };
-                (
-                    diagnostic_scope,
-                    diagnostic.range.start..diagnostic.range.end,
-                )
-            })
-            .collect()
+        let mut default_vec: Vec<(usize, std::ops::Range<usize>)> = Vec::new();
+        let mut info_vec = Vec::new();
+        let mut hint_vec = Vec::new();
+        let mut warning_vec = Vec::new();
+        let mut error_vec = Vec::new();
+
+        for diagnostic in doc.diagnostics() {
+            // Separate diagnostics into different Vecs by severity.
+            let (vec, scope) = match diagnostic.severity {
+                Some(Severity::Info) => (&mut info_vec, info),
+                Some(Severity::Hint) => (&mut hint_vec, hint),
+                Some(Severity::Warning) => (&mut warning_vec, warning),
+                Some(Severity::Error) => (&mut error_vec, error),
+                _ => (&mut default_vec, r#default),
+            };
+
+            // If any diagnostic overlaps ranges with the prior diagnostic,
+            // merge the two together. Otherwise push a new span.
+            match vec.last_mut() {
+                Some((_, range)) if diagnostic.range.start <= range.end => {
+                    // This branch merges overlapping diagnostics, assuming that the current
+                    // diagnostic starts on range.start or later. If this assertion fails,
+                    // we will discard some part of `diagnostic`. This implies that
+                    // `doc.diagnostics()` is not sorted by `diagnostic.range`.
+                    debug_assert!(range.start <= diagnostic.range.start);
+                    range.end = diagnostic.range.end.max(range.end)
+                }
+                _ => vec.push((scope, diagnostic.range.start..diagnostic.range.end)),
+            }
+        }
+
+        [default_vec, info_vec, hint_vec, warning_vec, error_vec]
     }
 
     /// Get highlight spans for selections in a document view.
@@ -405,7 +435,7 @@ impl EditorView {
         let characters = &whitespace.characters;
 
         let mut spans = Vec::new();
-        let mut visual_x = 0u16;
+        let mut visual_x = 0usize;
         let mut line = 0u16;
         let tab_width = doc.tab_width();
         let tab = if whitespace.render.tab() == WhitespaceRenderValue::All {
@@ -442,17 +472,22 @@ impl EditorView {
                 return;
             }
 
-            let starting_indent = (offset.col / tab_width) as u16;
-            // TODO: limit to a max indent level too. It doesn't cause visual artifacts but it would avoid some
-            // extra loops if the code is deeply nested.
+            let starting_indent =
+                (offset.col / tab_width) + config.indent_guides.skip_levels as usize;
 
-            for i in starting_indent..(indent_level / tab_width as u16) {
-                surface.set_string(
-                    viewport.x + (i * tab_width as u16) - offset.col as u16,
-                    viewport.y + line,
-                    &indent_guide_char,
-                    indent_guide_style,
-                );
+            // Don't draw indent guides outside of view
+            let end_indent = min(
+                indent_level,
+                // Add tab_width - 1 to round up, since the first visible
+                // indent might be a bit after offset.col
+                offset.col + viewport.width as usize + (tab_width - 1),
+            ) / tab_width;
+
+            for i in starting_indent..end_indent {
+                let x = (viewport.x as usize + (i * tab_width) - offset.col) as u16;
+                let y = viewport.y + line;
+                debug_assert!(surface.in_bounds(x, y));
+                surface.set_string(x, y, &indent_guide_char, indent_guide_style);
             }
         };
 
@@ -525,11 +560,14 @@ impl EditorView {
                     use helix_core::graphemes::{grapheme_width, RopeGraphemes};
 
                     for grapheme in RopeGraphemes::new(text) {
+                        let out_of_bounds = offset.col > (visual_x as usize)
+                            || (visual_x as usize) >= viewport.width as usize + offset.col;
+
                         if LineEnding::from_rope_slice(&grapheme).is_some() {
-                            if !out_of_bounds(visual_x) {
+                            if !out_of_bounds {
                                 // we still want to render an empty cell with the style
                                 surface.set_string(
-                                    viewport.x + visual_x - offset.col as u16,
+                                    (viewport.x as usize + visual_x - offset.col) as u16,
                                     viewport.y + line,
                                     &newline,
                                     style.patch(whitespace_style),
@@ -543,7 +581,7 @@ impl EditorView {
                                 .iter()
                                 .find(|t| t.kind.is_eol() && t.line == offset.row + line as usize)
                             {
-                                render_annotation(annot, line, visual_x, surface);
+                                render_annotation(annot, line, visual_x as u16, surface);
                             }
 
                             visual_x = 0;
@@ -582,10 +620,10 @@ impl EditorView {
 
                             let cut_off_start = offset.col.saturating_sub(visual_x as usize);
 
-                            if !out_of_bounds(visual_x) {
+                            if !out_of_bounds {
                                 // if we're offscreen just keep going until we hit a new line
                                 surface.set_string(
-                                    viewport.x + visual_x - offset.col as u16,
+                                    (viewport.x as usize + visual_x - offset.col) as u16,
                                     viewport.y + line,
                                     display_grapheme,
                                     if is_whitespace {
@@ -618,7 +656,7 @@ impl EditorView {
                                 last_line_indent_level = visual_x;
                             }
 
-                            visual_x = visual_x.saturating_add(width as u16);
+                            visual_x = visual_x.saturating_add(width);
                         }
                     }
                 }
@@ -745,26 +783,34 @@ impl EditorView {
         let mut offset = 0;
 
         let gutter_style = theme.get("ui.gutter");
+        let gutter_selected_style = theme.get("ui.gutter.selected");
 
         // avoid lots of small allocations by reusing a text buffer for each line
         let mut text = String::with_capacity(8);
 
-        for (constructor, width) in view.gutters() {
-            let gutter = constructor(editor, doc, view, theme, is_focused, *width);
-            text.reserve(*width); // ensure there's enough space for the gutter
+        for gutter_type in view.gutters() {
+            let gutter = gutter_type.style(editor, doc, view, theme, is_focused);
+            let width = gutter_type.width(view, doc);
+            text.reserve(width); // ensure there's enough space for the gutter
             for (i, line) in (view.offset.row..(last_line + 1)).enumerate() {
                 let selected = cursors.contains(&line);
                 let x = viewport.x + offset;
                 let y = viewport.y + i as u16;
 
+                let gutter_style = if selected {
+                    gutter_selected_style
+                } else {
+                    gutter_style
+                };
+
                 if let Some(style) = gutter(line, selected, &mut text) {
-                    surface.set_stringn(x, y, &text, *width, gutter_style.patch(style));
+                    surface.set_stringn(x, y, &text, width, gutter_style.patch(style));
                 } else {
                     surface.set_style(
                         Rect {
                             x,
                             y,
-                            width: *width as u16,
+                            width: width as u16,
                             height: 1,
                         },
                         gutter_style,
@@ -773,7 +819,7 @@ impl EditorView {
                 text.clear();
             }
 
-            offset += *width as u16;
+            offset += width as u16;
         }
     }
 
@@ -869,6 +915,53 @@ impl EditorView {
         }
     }
 
+    /// Apply the highlighting on the columns where a cursor is active
+    pub fn highlight_cursorcolumn(
+        doc: &Document,
+        view: &View,
+        surface: &mut Surface,
+        theme: &Theme,
+    ) {
+        let text = doc.text().slice(..);
+
+        // Manual fallback behaviour:
+        // ui.cursorcolumn.{p/s} -> ui.cursorcolumn -> ui.cursorline.{p/s}
+        let primary_style = theme
+            .try_get_exact("ui.cursorcolumn.primary")
+            .or_else(|| theme.try_get_exact("ui.cursorcolumn"))
+            .unwrap_or_else(|| theme.get("ui.cursorline.primary"));
+        let secondary_style = theme
+            .try_get_exact("ui.cursorcolumn.secondary")
+            .or_else(|| theme.try_get_exact("ui.cursorcolumn"))
+            .unwrap_or_else(|| theme.get("ui.cursorline.secondary"));
+
+        let inner_area = view.inner_area(doc);
+        let offset = view.offset.col;
+
+        let selection = doc.selection(view.id);
+        let primary = selection.primary();
+        for range in selection.iter() {
+            let is_primary = primary == *range;
+
+            let Position { row: _, col } =
+                visual_coords_at_pos(text, range.cursor(text), doc.tab_width());
+            // if the cursor is horizontally in the view
+            if col >= offset && inner_area.width > (col - offset) as u16 {
+                let area = Rect::new(
+                    inner_area.x + (col - offset) as u16,
+                    view.area.y,
+                    1,
+                    view.area.height,
+                );
+                if is_primary {
+                    surface.set_style(area, primary_style)
+                } else {
+                    surface.set_style(area, secondary_style)
+                }
+            }
+        }
+    }
+
     /// Handle events by looking them up in `self.keymaps`. Returns None
     /// if event was handled (a command was executed or a subkeymap was
     /// activated). Only KeymapResult::{NotFound, Cancelled} is returned
@@ -880,6 +973,7 @@ impl EditorView {
         event: KeyEvent,
     ) -> Option<KeymapResult> {
         let mut last_mode = mode;
+        self.pseudo_pending.extend(self.keymaps.pending());
         let key_result = self.keymaps.get(mode, event);
         cxt.editor.autoinfo = self.keymaps.sticky().map(|node| node.infobox());
 
@@ -904,9 +998,10 @@ impl EditorView {
 
                     // TODO: Use an on_mode_change hook to remove signature help
                     cxt.jobs.callback(async {
-                        let call: job::Callback = Box::new(|_editor, compositor| {
-                            compositor.remove(SignatureHelp::ID);
-                        });
+                        let call: job::Callback =
+                            Callback::EditorCompositor(Box::new(|_editor, compositor| {
+                                compositor.remove(SignatureHelp::ID);
+                            }));
                         Ok(call)
                     });
                 }
@@ -967,37 +1062,40 @@ impl EditorView {
             }
             // special handling for repeat operator
             (key!('.'), _) if self.keymaps.pending().is_empty() => {
-                // first execute whatever put us into insert mode
-                self.last_insert.0.execute(cxt);
-                // then replay the inputs
-                for key in self.last_insert.1.clone() {
-                    match key {
-                        InsertEvent::Key(key) => self.insert_mode(cxt, key),
-                        InsertEvent::CompletionApply(compl) => {
-                            let (view, doc) = current!(cxt.editor);
+                for _ in 0..cxt.editor.count.map_or(1, NonZeroUsize::into) {
+                    // first execute whatever put us into insert mode
+                    self.last_insert.0.execute(cxt);
+                    // then replay the inputs
+                    for key in self.last_insert.1.clone() {
+                        match key {
+                            InsertEvent::Key(key) => self.insert_mode(cxt, key),
+                            InsertEvent::CompletionApply(compl) => {
+                                let (view, doc) = current!(cxt.editor);
 
-                            doc.restore(view.id);
+                                doc.restore(view);
 
-                            let text = doc.text().slice(..);
-                            let cursor = doc.selection(view.id).primary().cursor(text);
+                                let text = doc.text().slice(..);
+                                let cursor = doc.selection(view.id).primary().cursor(text);
 
-                            let shift_position =
-                                |pos: usize| -> usize { pos + cursor - compl.trigger_offset };
+                                let shift_position =
+                                    |pos: usize| -> usize { pos + cursor - compl.trigger_offset };
 
-                            let tx = Transaction::change(
-                                doc.text(),
-                                compl.changes.iter().cloned().map(|(start, end, t)| {
-                                    (shift_position(start), shift_position(end), t)
-                                }),
-                            );
-                            doc.apply(&tx, view.id);
-                        }
-                        InsertEvent::TriggerCompletion => {
-                            let (_, doc) = current!(cxt.editor);
-                            doc.savepoint();
+                                let tx = Transaction::change(
+                                    doc.text(),
+                                    compl.changes.iter().cloned().map(|(start, end, t)| {
+                                        (shift_position(start), shift_position(end), t)
+                                    }),
+                                );
+                                apply_transaction(&tx, doc, view);
+                            }
+                            InsertEvent::TriggerCompletion => {
+                                let (_, doc) = current!(cxt.editor);
+                                doc.savepoint();
+                            }
                         }
                     }
                 }
+                cxt.editor.count = None;
             }
             _ => {
                 // set the count
@@ -1054,23 +1152,20 @@ impl EditorView {
         editor.clear_idle_timer(); // don't retrigger
     }
 
-    pub fn handle_idle_timeout(&mut self, cx: &mut crate::compositor::Context) -> EventResult {
-        if self.completion.is_some()
-            || cx.editor.mode != Mode::Insert
-            || !cx.editor.config().auto_completion
-        {
+    pub fn handle_idle_timeout(&mut self, cx: &mut commands::Context) -> EventResult {
+        if let Some(completion) = &mut self.completion {
+            return if completion.ensure_item_resolved(cx) {
+                EventResult::Consumed(None)
+            } else {
+                EventResult::Ignored(None)
+            };
+        }
+
+        if cx.editor.mode != Mode::Insert || !cx.editor.config().auto_completion {
             return EventResult::Ignored(None);
         }
 
-        let mut cx = commands::Context {
-            register: None,
-            editor: cx.editor,
-            jobs: cx.jobs,
-            count: None,
-            callback: None,
-            on_next_key_callback: None,
-        };
-        crate::commands::insert::idle_completion(&mut cx);
+        crate::commands::insert::idle_completion(cx);
 
         EventResult::Consumed(None)
     }
@@ -1357,6 +1452,11 @@ impl Component for EditorView {
                 }
 
                 self.on_next_key = cx.on_next_key_callback.take();
+                match self.on_next_key {
+                    Some(_) => self.pseudo_pending.push(key),
+                    None => self.pseudo_pending.clear(),
+                }
+
                 // appease borrowck
                 let callback = cx.callback.take();
 
@@ -1386,7 +1486,16 @@ impl Component for EditorView {
             }
 
             Event::Mouse(event) => self.handle_mouse_event(event, &mut cx),
-            Event::FocusGained | Event::FocusLost => EventResult::Ignored(None),
+            Event::IdleTimeout => self.handle_idle_timeout(&mut cx),
+            Event::FocusGained => EventResult::Ignored(None),
+            Event::FocusLost => {
+                if context.editor.config().auto_save {
+                    if let Err(e) = commands::typed::write_all_impl(context, false, false) {
+                        context.editor.set_error(format!("{}", e));
+                    }
+                }
+                EventResult::Consumed(None)
+            }
         }
     }
 
@@ -1457,8 +1566,8 @@ impl Component for EditorView {
             for key in self.keymaps.pending() {
                 disp.push_str(&key.key_sequence_format());
             }
-            if let Some(pseudo_pending) = &cx.editor.pseudo_pending {
-                disp.push_str(pseudo_pending.as_str())
+            for key in &self.pseudo_pending {
+                disp.push_str(&key.key_sequence_format());
             }
             let style = cx.editor.theme.get("ui.text");
             let macro_width = if cx.editor.macro_recording.is_some() {

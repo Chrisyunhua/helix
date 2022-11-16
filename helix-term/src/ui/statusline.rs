@@ -142,8 +142,12 @@ where
         helix_view::editor::StatusLineElement::FileType => render_file_type,
         helix_view::editor::StatusLineElement::Diagnostics => render_diagnostics,
         helix_view::editor::StatusLineElement::Selections => render_selections,
+        helix_view::editor::StatusLineElement::PrimarySelectionLength => {
+            render_primary_selection_length
+        }
         helix_view::editor::StatusLineElement::Position => render_position,
         helix_view::editor::StatusLineElement::PositionPercentage => render_position_percentage,
+        helix_view::editor::StatusLineElement::TotalLineNumbers => render_total_line_numbers,
         helix_view::editor::StatusLineElement::Separator => render_separator,
         helix_view::editor::StatusLineElement::Spacer => render_spacer,
     }
@@ -154,16 +158,16 @@ where
     F: Fn(&mut RenderContext, String, Option<Style>) + Copy,
 {
     let visible = context.focused;
-
+    let modenames = &context.editor.config().statusline.mode;
     write(
         context,
         format!(
             " {} ",
             if visible {
                 match context.editor.mode() {
-                    Mode::Insert => "INS",
-                    Mode::Select => "SEL",
-                    Mode::Normal => "NOR",
+                    Mode::Insert => &modenames.insert,
+                    Mode::Select => &modenames.select,
+                    Mode::Normal => &modenames.normal,
                 }
             } else {
                 // If not focused, explicitly leave an empty space instead of returning None.
@@ -253,6 +257,18 @@ where
     );
 }
 
+fn render_primary_selection_length<F>(context: &mut RenderContext, write: F)
+where
+    F: Fn(&mut RenderContext, String, Option<Style>) + Copy,
+{
+    let tot_sel = context.doc.selection(context.view.id).primary().len();
+    write(
+        context,
+        format!(" {} char{} ", tot_sel, if tot_sel == 1 { "" } else { "s" }),
+        None,
+    );
+}
+
 fn get_position(context: &RenderContext) -> Position {
     coords_at_pos(
         context.doc.text().slice(..),
@@ -274,6 +290,15 @@ where
         format!(" {}:{} ", position.row + 1, position.col + 1),
         None,
     );
+}
+
+fn render_total_line_numbers<F>(context: &mut RenderContext, write: F)
+where
+    F: Fn(&mut RenderContext, String, Option<Style>) + Copy,
+{
+    let total_line_numbers = context.doc.text().len_lines();
+
+    write(context, format!(" {} ", total_line_numbers), None);
 }
 
 fn render_position_percentage<F>(context: &mut RenderContext, write: F)

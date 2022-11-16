@@ -49,6 +49,7 @@ impl Client {
         root_markers: &[String],
         id: usize,
         req_timeout: u64,
+        doc_path: Option<&std::path::PathBuf>,
     ) -> Result<(Self, UnboundedReceiver<(usize, Call)>, Arc<Notify>)> {
         // Resolve path to the binary
         let cmd = which::which(cmd).map_err(|err| anyhow::anyhow!(err))?;
@@ -72,7 +73,10 @@ impl Client {
         let (server_rx, server_tx, initialize_notify) =
             Transport::start(reader, writer, stderr, id);
 
-        let root_path = find_root(None, root_markers);
+        let root_path = find_root(
+            doc_path.and_then(|x| x.parent().and_then(|x| x.to_str())),
+            root_markers,
+        );
 
         let root_uri = lsp::Url::from_file_path(root_path.clone()).ok();
 
@@ -294,6 +298,9 @@ impl Client {
                         dynamic_registration: Some(false),
                         ..Default::default()
                     }),
+                    execute_command: Some(lsp::DynamicRegistrationClientCapabilities {
+                        dynamic_registration: Some(false),
+                    }),
                     ..Default::default()
                 }),
                 text_document: Some(lsp::TextDocumentClientCapabilities {
@@ -307,6 +314,7 @@ impl Client {
                                     String::from("additionalTextEdits"),
                                 ],
                             }),
+                            insert_replace_support: Some(true),
                             ..Default::default()
                         }),
                         completion_item_kind: Some(lsp::CompletionItemKindCapability {
